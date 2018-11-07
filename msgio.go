@@ -104,6 +104,22 @@ func (q *qreader) addConn(r *msgReader) {
 	q.mu.Unlock()
 }
 
+func (q *qreader) removeConn(r *msgReader) {
+	q.mu.Lock()
+	var i int
+	var found bool
+	for i = range q.rs {
+		if q.rs[i] == r {
+			found = true
+			break
+		}
+	}
+	if found {
+		q.rs = append(q.rs[:i], q.rs[i+1:]...)
+	}
+	q.mu.Unlock()
+}
+
 func (q *qreader) read(ctx context.Context, msg *Msg) error {
 	q.sem.lock()
 	select {
@@ -114,6 +130,11 @@ func (q *qreader) read(ctx context.Context, msg *Msg) error {
 }
 
 func (q *qreader) listen(ctx context.Context, r *msgReader) {
+	defer func() {
+		q.removeConn(r)
+		r.Close()
+	}()
+
 	for {
 		var msg Msg
 		err := r.read(ctx, &msg)
@@ -121,10 +142,10 @@ func (q *qreader) listen(ctx context.Context, r *msgReader) {
 		case <-ctx.Done():
 			return
 		default:
-			q.c <- msg
 			if err != nil {
 				return
 			}
+			q.c <- msg
 		}
 	}
 }
@@ -164,6 +185,22 @@ func (mw *mwriter) addConn(w *msgWriter) {
 	mw.mu.Unlock()
 }
 
+func (w *mwriter) removeConn(_w *msgWriter) {
+	w.mu.Lock()
+	var i int
+	var found bool
+	for i = range w.ws {
+		if w.ws[i] == _w {
+			found = true
+			break
+		}
+	}
+	if found {
+		w.ws = append(w.ws[:i], w.ws[i+1:]...)
+	}
+	w.mu.Unlock()
+}
+
 func (w *mwriter) write(ctx context.Context, msg Msg) error {
 	w.sem.lock()
 	grp, ctx := errgroup.WithContext(ctx)
@@ -171,7 +208,14 @@ func (w *mwriter) write(ctx context.Context, msg Msg) error {
 	for i := range w.ws {
 		ww := w.ws[i]
 		grp.Go(func() error {
-			return ww.write(ctx, msg)
+			err := ww.write(ctx, msg)
+			if err != nil {
+				go func() {
+					w.removeConn(ww)
+					ww.Close()
+				}()
+			}
+			return nil
 		})
 	}
 	err := grp.Wait()
